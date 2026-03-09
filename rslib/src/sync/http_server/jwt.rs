@@ -1,6 +1,7 @@
 // Copyright: Ankitects Pty Ltd and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
+use jsonwebtoken::TokenData;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use snafu::ResultExt;
 use snafu::Whatever;
@@ -8,18 +9,15 @@ use snafu::Whatever;
 use crate::error;
 
 #[derive(serde::Deserialize)]
-struct JwtClaims {
-    sub: String,
-    exp: usize,
+pub(super) struct JwtClaims {
+    pub sub: String,
 }
 
-pub(super) fn verify_jwt(token: &str, secret: &str) -> error::Result<String, Whatever> {
+pub(super) fn verify_jwt(token: &str, secret: &str) -> error::Result<TokenData<JwtClaims>, Whatever> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
     validation.leeway = 0;
-    decode::<JwtClaims>(token, &key, &validation)
-        .map(|data| data.claims.sub)
-        .whatever_context("invalid or expired JWT")
+    decode::<JwtClaims>(token, &key, &validation).whatever_context("invalid or expired JWT")
 }
 
 pub(super) fn make_jwt(user_id: &str, secret: &str) -> error::Result<String, Whatever> {
@@ -64,7 +62,7 @@ mod tests {
     #[test]
     fn valid_token_returns_sub() {
         let token = make_token("user123", 3600, "testsecret");
-        assert_eq!(verify_jwt(&token, "testsecret").unwrap(), "user123");
+        assert_eq!(verify_jwt(&token, "testsecret").unwrap().claims.sub, "user123");
     }
 
     #[test]
@@ -87,6 +85,6 @@ mod tests {
     #[test]
     fn make_jwt_produces_valid_token() {
         let token = make_jwt("user456", "testsecret").unwrap();
-        assert_eq!(verify_jwt(&token, "testsecret").unwrap(), "user456");
+        assert_eq!(verify_jwt(&token, "testsecret").unwrap().claims.sub, "user456");
     }
 }

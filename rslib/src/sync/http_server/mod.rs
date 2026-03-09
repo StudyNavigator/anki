@@ -19,29 +19,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use anki_io::create_dir_all;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use axum::Router;
 use axum_client_ip::ClientIpSource;
-use pbkdf2::password_hash::PasswordHash;
-use pbkdf2::password_hash::PasswordHasher;
-use pbkdf2::password_hash::PasswordVerifier;
-use pbkdf2::password_hash::SaltString;
-use pbkdf2::Pbkdf2;
-use snafu::whatever;
-use snafu::OptionExt;
 use snafu::ResultExt;
 use snafu::Whatever;
 use tokio::net::TcpListener;
 use tracing::Span;
 
 use crate::error;
-use crate::media::files::sha1_of_data;
 use crate::sync::error::HttpResult;
 use crate::sync::error::OrHttpErr;
+use crate::sync::http_server::jwt::verify_jwt;
 use crate::sync::http_server::logging::with_logging_layer;
-use crate::sync::http_server::media_manager::ServerMediaManager;
 use crate::sync::http_server::routes::collection_sync_router;
 use crate::sync::http_server::routes::health_check_handler;
 use crate::sync::http_server::routes::media_sync_router;
@@ -54,6 +45,8 @@ use crate::sync::response::SyncResponse;
 
 pub struct SimpleServer {
     state: Mutex<SimpleServerInner>,
+    jwt_secret: String,
+    base_folder: PathBuf,
 }
 
 pub struct SimpleServerInner {
@@ -71,6 +64,8 @@ pub struct SyncServerConfig {
     pub base_folder: PathBuf,
     #[serde(default = "default_ip_header")]
     pub ip_header: ClientIpSource,
+    #[serde()]
+    pub jwt_secret: String
 }
 
 fn default_host() -> IpAddr {
@@ -91,67 +86,6 @@ pub fn default_ip_header() -> ClientIpSource {
     ClientIpSource::ConnectInfo
 }
 
-impl SimpleServerInner {
-    fn new_from_env(base_folder: &Path) -> error::Result<Self, Whatever> {
-        let mut idx = 1;
-        let mut users: HashMap<String, User> = Default::default();
-        loop {
-            let envvar = format!("SYNC_USER{idx}");
-            match std::env::var(&envvar) {
-                Ok(val) => {
-                    let hkey = derive_hkey(&val);
-                    let (name, pwhash) = {
-                        let (name, password) = val.split_once(':').with_whatever_context(|| {
-                            format!("{envvar} should be in 'username:password' format.")
-                        })?;
-                        if std::env::var("PASSWORDS_HASHED").is_ok() {
-                            (name, password.to_string())
-                        } else {
-                            (
-                                name,
-                                // Plain text passwords provided; hash them with a fixed salt.
-                                Pbkdf2
-                                    .hash_password(
-                                        password.as_bytes(),
-                                        &SaltString::from_b64("tonuvYGpksNFQBlEmm3lxg").unwrap(),
-                                    )
-                                    .expect("couldn't hash password")
-                                    .to_string(),
-                            )
-                        }
-                    };
-                    let folder = base_folder.join(name);
-                    create_dir_all(&folder).whatever_context("creating SYNC_BASE")?;
-                    let media =
-                        ServerMediaManager::new(&folder).whatever_context("opening media")?;
-                    users.insert(
-                        hkey,
-                        User {
-                            name: name.into(),
-                            password_hash: pwhash,
-                            col: None,
-                            sync_state: None,
-                            media,
-                            folder,
-                        },
-                    );
-                    idx += 1;
-                }
-                Err(_) => break,
-            }
-        }
-        if users.is_empty() {
-            whatever!("No users defined; SYNC_USER1 env var should be set.");
-        }
-        Ok(Self { users })
-    }
-}
-
-// This is not what AnkiWeb does, but should suffice for this use case.
-fn derive_hkey(user_and_pass: &str) -> String {
-    hex::encode(sha1_of_data(user_and_pass.as_bytes()))
-}
-
 impl SimpleServer {
     pub(in crate::sync) async fn with_authenticated_user<F, I, O>(
         &self,
@@ -161,11 +95,22 @@ impl SimpleServer {
     where
         F: FnOnce(&mut User, SyncRequest<I>) -> HttpResult<O>,
     {
+        let user_id = verify_jwt(&req.sync_key, &self.jwt_secret)
+            .ok()
+            .or_forbidden("invalid or expired token")?
+            .claims
+            .sub;
+
         let mut state = self.state.lock().unwrap();
-        let user = state
-            .users
-            .get_mut(&req.sync_key)
-            .or_forbidden("invalid hkey")?;
+
+        if !state.users.contains_key(&user_id) {
+            let user = User::new(&user_id, &self.base_folder)
+                .ok()
+                .or_internal_err("creating user")?;
+            state.users.insert(user_id.clone(), user);
+        }
+
+        let user = state.users.get_mut(&user_id).unwrap();
         Span::current().record("uid", &user.name);
         Span::current().record("client", &req.client_version);
         Span::current().record("session", &req.session_key);
@@ -174,62 +119,24 @@ impl SimpleServer {
 
     pub(in crate::sync) fn get_host_key(
         &self,
-        request: HostKeyRequest,
+        _request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
-        let state = self.state.lock().unwrap();
-
-        // This control structure might seem a bit crude,
-        // its goal is to prevent a timing attack from gaining
-        // information about whether a specific user exists.
-        let user = {
-            // This inner block returns Ok(hkey,user) if a user with corresponding
-            // name is found and Err(user) with a random user if it isn't found.
-            // The user is needed to verify against a random hash,
-            // before returning an Error.
-            let mut result: Result<(String, &User), &User> =
-                Err(state.users.iter().next().unwrap().1);
-            for (hkey, user) in state.users.iter() {
-                if user.name == request.username {
-                    result = Ok((hkey.to_string(), user));
-                }
-            }
-            result
-        };
-
-        match user {
-            Ok((key, user)) => {
-                // Verify password
-                let pwhash =
-                    &PasswordHash::new(&user.password_hash).expect("couldn't parse password hash");
-                if Pbkdf2
-                    .verify_password(request.password.as_bytes(), pwhash)
-                    .is_ok()
-                {
-                    SyncResponse::try_from_obj(HostKeyResponse { key })
-                } else {
-                    None.or_forbidden("invalid user/pass in get_host_key")
-                }
-            }
-            Err(user) => {
-                // Verify random password, in order to ensure constant-timedness,
-                // then return an error
-                let pwhash =
-                    &PasswordHash::new(&user.password_hash).expect("couldn't parse password hash");
-                let _ = Pbkdf2.verify_password(request.password.as_bytes(), pwhash);
-                None.or_forbidden("invalid user/pass in get_host_key")
-            }
-        }
+        None.or_forbidden("host key login is disabled; use the app to authenticate")
     }
+
     pub fn is_running() -> bool {
         let config = envy::prefixed("SYNC_")
             .from_env::<SyncServerConfig>()
             .unwrap();
         std::net::TcpStream::connect(format!("{}:{}", config.host, config.port)).is_ok()
     }
-    pub fn new(base_folder: &Path) -> error::Result<Self, Whatever> {
-        let inner = SimpleServerInner::new_from_env(base_folder)?;
+    pub fn new(base_folder: &Path, jwt_secret: String) -> error::Result<Self, Whatever> {
         Ok(SimpleServer {
-            state: Mutex::new(inner),
+            state: Mutex::new(SimpleServerInner {
+                users: HashMap::new(),
+            }),
+            jwt_secret,
+            base_folder: base_folder.to_path_buf(),
         })
     }
 
@@ -237,7 +144,7 @@ impl SimpleServer {
         config: SyncServerConfig,
     ) -> error::Result<(SocketAddr, ServerFuture), Whatever> {
         let server = Arc::new(
-            SimpleServer::new(&config.base_folder).whatever_context("unable to create server")?,
+            SimpleServer::new(&config.base_folder, config.jwt_secret).whatever_context("unable to create server")?,
         );
         let address = &format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind(address)
