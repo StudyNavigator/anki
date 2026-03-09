@@ -88,6 +88,7 @@ where
         port: 0,
         base_folder: base_folder.path().into(),
         ip_header: default_ip_header(),
+        jwt_secret: String::from("testsecret")
     })
     .await
     .unwrap();
