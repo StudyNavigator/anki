@@ -10,16 +10,16 @@ use crate::error;
 #[derive(serde::Deserialize)]
 struct JwtClaims {
     sub: String,
-    exp: String
+    exp: usize,
 }
 
-pub(super) fn verify_jwt(token: &str, secret: &str) -> Option<String> {
+pub(super) fn verify_jwt(token: &str, secret: &str) -> error::Result<String, Whatever> {
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
     validation.leeway = 0;
     decode::<JwtClaims>(token, &key, &validation)
-        .ok()
         .map(|data| data.claims.sub)
+        .whatever_context("invalid or expired JWT")
 }
 
 pub(super) fn make_jwt(user_id: &str, secret: &str) -> error::Result<String, Whatever> {
@@ -64,29 +64,29 @@ mod tests {
     #[test]
     fn valid_token_returns_sub() {
         let token = make_token("user123", 3600, "testsecret");
-        assert_eq!(verify_jwt(&token, "testsecret"), Some("user123".to_string()));
+        assert_eq!(verify_jwt(&token, "testsecret").unwrap(), "user123");
     }
 
     #[test]
     fn wrong_secret_returns_none() {
         let token = make_token("user123", 3600, "testsecret");
-        assert_eq!(verify_jwt(&token, "wrongsecret"), None);
+        assert!(verify_jwt(&token, "wrongsecret").is_err());
     }
 
     #[test]
     fn expired_token_returns_none() {
         let token = make_token("user123", -10, "testsecret");
-        assert_eq!(verify_jwt(&token, "testsecret"), None);
+        assert!(verify_jwt(&token, "testsecret").is_err());
     }
 
     #[test]
     fn garbage_token_returns_none() {
-        assert_eq!(verify_jwt("not.a.token", "testsecret"), None);
+        assert!(verify_jwt("not.a.token", "testsecret").is_err());
     }
 
     #[test]
     fn make_jwt_produces_valid_token() {
         let token = make_jwt("user456", "testsecret").unwrap();
-        assert_eq!(verify_jwt(&token, "testsecret"), Some("user456".to_string()));
+        assert_eq!(verify_jwt(&token, "testsecret").unwrap(), "user456");
     }
 }
