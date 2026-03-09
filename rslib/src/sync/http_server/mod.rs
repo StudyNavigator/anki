@@ -121,6 +121,8 @@ impl SimpleServer {
         &self,
         _request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
+        // TODO: once users have a username / password we could re-implement this login method
+        // This will be needed for mobile clients, which don't have a browser-based login flow
         None.or_forbidden("host key login is disabled; use the app to authenticate")
     }
 
