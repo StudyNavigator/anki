@@ -70,7 +70,7 @@ htmlescape.workspace = true
 hyper.workspace = true
 id_tree.workspace = true
 itertools.workspace = true
-jsonwebtoken = { workspace = true }
+jsonwebtoken.workspace = true
 nom.workspace = true
 num_cpus.workspace = true
 num_enum.workspace = true
