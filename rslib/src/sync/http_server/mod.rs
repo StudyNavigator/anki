@@ -49,7 +49,9 @@ pub struct SimpleServer {
 }
 
 pub struct SimpleServerInner {
-    /// hkey->user
+    /// hkey -> user_id
+    hkey_map: HashMap<String, String>,
+    /// user_id -> User
     users: HashMap<String, User>,
 }
 
@@ -97,21 +99,31 @@ impl SimpleServer {
         let hkey = req.sync_key.clone();
 
         // Check cache without holding the lock across an await point.
-        let cached = self.state.lock().unwrap().users.contains_key(&hkey);
+        let cached_user_id = self.state.lock().unwrap().hkey_map.get(&hkey).cloned();
 
-        if !cached {
+        let user_id = if let Some(id) = cached_user_id {
+            id
+        } else {
             let id = self
                 .verify_hkey(&hkey)
                 .await
                 .or_forbidden("invalid or expired token")?;
-            let user = User::new(&id, &self.base_folder)
-                .ok()
-                .or_internal_err("creating user")?;
-            self.state.lock().unwrap().users.insert(hkey.clone(), user);
-        }
+            let mut state = self.state.lock().unwrap();
+            // Remove any stale hkeys that pointed to the same user.
+            state.hkey_map.retain(|_, v| v != &id);
+            // Create the User entry if this is a first-ever login for this user_id.
+            if !state.users.contains_key(&id) {
+                let user = User::new(&id, &self.base_folder)
+                    .ok()
+                    .or_internal_err("creating user")?;
+                state.users.insert(id.clone(), user);
+            }
+            state.hkey_map.insert(hkey.clone(), id.clone());
+            id
+        };
 
         let mut state = self.state.lock().unwrap();
-        let user = state.users.get_mut(&hkey).unwrap();
+        let user = state.users.get_mut(&user_id).unwrap();
         Span::current().record("uid", &user.name);
         Span::current().record("client", &req.client_version);
         Span::current().record("session", &req.session_key);
@@ -167,9 +179,7 @@ impl SimpleServer {
             .or_forbidden("failed to contact auth server")?;
 
         if !resp.status().is_success() {
-            println!("Failed login attempt for user {}", request.username);
-            println!("Response status: {}", resp.status());
-            println!("Response body: {}", resp.text().await.unwrap_or_default());
+            tracing::warn!(username = %request.username, status = %resp.status(), "failed login attempt");
             return None.or_forbidden("invalid credentials");
         }
 
@@ -199,6 +209,7 @@ impl SimpleServer {
     ) -> error::Result<Self, Whatever> {
         Ok(SimpleServer {
             state: Mutex::new(SimpleServerInner {
+                hkey_map: HashMap::new(),
                 users: HashMap::new(),
             }),
             api_url,
