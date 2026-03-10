@@ -2,7 +2,6 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 mod handlers;
-mod jwt;
 mod logging;
 mod media_manager;
 mod routes;
@@ -31,7 +30,6 @@ use tracing::Span;
 use crate::error;
 use crate::sync::error::HttpResult;
 use crate::sync::error::OrHttpErr;
-use crate::sync::http_server::jwt::verify_jwt;
 use crate::sync::http_server::logging::with_logging_layer;
 use crate::sync::http_server::routes::collection_sync_router;
 use crate::sync::http_server::routes::health_check_handler;
@@ -45,7 +43,8 @@ use crate::sync::response::SyncResponse;
 
 pub struct SimpleServer {
     state: Mutex<SimpleServerInner>,
-    jwt_secret: String,
+    api_url: String,
+    api_secret: String,
     base_folder: PathBuf,
 }
 
@@ -64,8 +63,8 @@ pub struct SyncServerConfig {
     pub base_folder: PathBuf,
     #[serde(default = "default_ip_header")]
     pub ip_header: ClientIpSource,
-    #[serde()]
-    pub jwt_secret: String
+    pub api_url: String,
+    pub api_secret: String,
 }
 
 fn default_host() -> IpAddr {
@@ -95,35 +94,95 @@ impl SimpleServer {
     where
         F: FnOnce(&mut User, SyncRequest<I>) -> HttpResult<O>,
     {
-        let user_id = verify_jwt(&req.sync_key, &self.jwt_secret)
-            .ok()
-            .or_forbidden("invalid or expired token")?
-            .claims
-            .sub;
+        let hkey = req.sync_key.clone();
 
-        let mut state = self.state.lock().unwrap();
+        // Check cache without holding the lock across an await point.
+        let cached = self.state.lock().unwrap().users.contains_key(&hkey);
 
-        if !state.users.contains_key(&user_id) {
-            let user = User::new(&user_id, &self.base_folder)
+        if !cached {
+            let id = self
+                .verify_hkey(&hkey)
+                .await
+                .or_forbidden("invalid or expired token")?;
+            let user = User::new(&id, &self.base_folder)
                 .ok()
                 .or_internal_err("creating user")?;
-            state.users.insert(user_id.clone(), user);
+            self.state.lock().unwrap().users.insert(hkey.clone(), user);
         }
 
-        let user = state.users.get_mut(&user_id).unwrap();
+        let mut state = self.state.lock().unwrap();
+        let user = state.users.get_mut(&hkey).unwrap();
         Span::current().record("uid", &user.name);
         Span::current().record("client", &req.client_version);
         Span::current().record("session", &req.session_key);
         op(user, req)
     }
 
-    pub(in crate::sync) fn get_host_key(
+    async fn verify_hkey(&self, hkey: &str) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct VerifyResponse {
+            user_id: String,
+        }
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/internal/sync/verify", self.api_url))
+            .header("Authorization", format!("Bearer {hkey}"))
+            .header("X-Internal-Secret", &self.api_secret)
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        resp.json::<VerifyResponse>().await.ok().map(|r| r.user_id)
+    }
+
+    pub(in crate::sync) async fn get_host_key(
         &self,
-        _request: HostKeyRequest,
+        request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
-        // TODO: once users have a username / password we could re-implement this login method
-        // This will be needed for mobile clients, which don't have a browser-based login flow
-        None.or_forbidden("host key login is disabled; use the app to authenticate")
+        #[derive(serde::Serialize)]
+        struct TokenRequest<'a> {
+            username: &'a str,
+            password: &'a str,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            hkey: String,
+        }
+
+        let resp = reqwest::Client::new()
+            .post(format!("{}/internal/sync/token", self.api_url))
+            .header("X-Internal-Secret", &self.api_secret)
+            .json(&TokenRequest {
+                username: &request.username,
+                password: &request.password,
+            })
+            .send()
+            .await
+            .ok()
+            .or_forbidden("failed to contact auth server")?;
+
+        if !resp.status().is_success() {
+            println!("Failed login attempt for user {}", request.username);
+            println!("Response status: {}", resp.status());
+            println!("Response body: {}", resp.text().await.unwrap_or_default());
+            return None.or_forbidden("invalid credentials");
+        }
+
+        let token_resp: TokenResponse = resp
+            .json()
+            .await
+            .ok()
+            .or_internal_err("invalid response from auth server")?;
+
+        SyncResponse::try_from_obj(HostKeyResponse {
+            key: token_resp.hkey,
+        })
+        .or_internal_err("encoding response")
     }
 
     pub fn is_running() -> bool {
@@ -132,12 +191,18 @@ impl SimpleServer {
             .unwrap();
         std::net::TcpStream::connect(format!("{}:{}", config.host, config.port)).is_ok()
     }
-    pub fn new(base_folder: &Path, jwt_secret: String) -> error::Result<Self, Whatever> {
+
+    pub fn new(
+        base_folder: &Path,
+        api_url: String,
+        api_secret: String,
+    ) -> error::Result<Self, Whatever> {
         Ok(SimpleServer {
             state: Mutex::new(SimpleServerInner {
                 users: HashMap::new(),
             }),
-            jwt_secret,
+            api_url,
+            api_secret,
             base_folder: base_folder.to_path_buf(),
         })
     }
@@ -146,7 +211,8 @@ impl SimpleServer {
         config: SyncServerConfig,
     ) -> error::Result<(SocketAddr, ServerFuture), Whatever> {
         let server = Arc::new(
-            SimpleServer::new(&config.base_folder, config.jwt_secret).whatever_context("unable to create server")?,
+            SimpleServer::new(&config.base_folder, config.api_url, config.api_secret)
+                .whatever_context("unable to create server")?,
         );
         let address = &format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind(address)
