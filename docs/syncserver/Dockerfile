@@ -1,14 +1,14 @@
 FROM rust:1.85.0-alpine3.20 AS builder
 
-ARG ANKI_VERSION
+WORKDIR /anki-server
+
+COPY . .
 
 RUN apk update && apk add --no-cache build-base protobuf && rm -rf /var/cache/apk/*
 
-RUN cargo install --git https://github.com/ankitects/anki.git \
---tag ${ANKI_VERSION} \
---root /anki-server  \
---locked \
-anki-sync-server
+ENV PROTOC=/usr/bin/protoc
+
+RUN cargo build --release --package anki-sync-server
 
 FROM alpine:3.21.0
 
@@ -17,14 +17,14 @@ FROM alpine:3.21.0
 ENV PUID=1000
 ENV PGID=1000
 
-COPY --from=builder /anki-server/bin/anki-sync-server /usr/local/bin/anki-sync-server
+COPY --from=builder /anki-server/target/release/anki-sync-server /usr/local/bin/anki-sync-server
 
 RUN apk update && apk add --no-cache bash su-exec && rm -rf /var/cache/apk/*
 
 
 EXPOSE 8080
 
-COPY entrypoint.sh /entrypoint.sh
+COPY docs/syncserver/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
@@ -37,4 +37,3 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 VOLUME /anki_data
 
-LABEL maintainer="Jean Khawand <jk@jeankhawand.com>"
