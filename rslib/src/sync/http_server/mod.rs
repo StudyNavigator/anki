@@ -22,6 +22,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use axum::Router;
 use axum_client_ip::ClientIpSource;
+use hyper::StatusCode;
 use snafu::ResultExt;
 use snafu::Whatever;
 use tokio::net::TcpListener;
@@ -43,6 +44,7 @@ use crate::sync::response::SyncResponse;
 
 pub struct SimpleServer {
     state: Mutex<SimpleServerInner>,
+    http_client: reqwest::Client,
     api_url: String,
     api_secret: String,
     base_folder: PathBuf,
@@ -123,7 +125,10 @@ impl SimpleServer {
         };
 
         let mut state = self.state.lock().unwrap();
-        let user = state.users.get_mut(&user_id).unwrap();
+        let user = state
+            .users
+            .get_mut(&user_id)
+            .or_internal_err("fetching user")?;
         Span::current().record("uid", &user.name);
         Span::current().record("client", &req.client_version);
         Span::current().record("session", &req.session_key);
@@ -136,7 +141,8 @@ impl SimpleServer {
             user_id: String,
         }
 
-        let resp = reqwest::Client::new()
+        let resp = self
+            .http_client
             .get(format!("{}/internal/sync/verify", self.api_url))
             .header("Authorization", format!("Bearer {hkey}"))
             .header("X-Internal-Secret", &self.api_secret)
@@ -166,7 +172,8 @@ impl SimpleServer {
             hkey: String,
         }
 
-        let resp = reqwest::Client::new()
+        let resp = self
+            .http_client
             .post(format!("{}/internal/sync/token", self.api_url))
             .header("X-Internal-Secret", &self.api_secret)
             .json(&TokenRequest {
@@ -175,12 +182,27 @@ impl SimpleServer {
             })
             .send()
             .await
-            .ok()
-            .or_forbidden("failed to contact auth server")?;
+            .map_err(|e| {
+                tracing::warn!(error = %e, "failed to contact auth server");
+                e
+            })
+            .or_internal_err("failed to contact auth server")?;
 
         if !resp.status().is_success() {
-            tracing::warn!(username = %request.username, status = %resp.status(), "failed login attempt");
-            return None.or_forbidden("invalid credentials");
+            match resp.status() {
+                StatusCode::UNAUTHORIZED => {
+                    tracing::warn!(username = %request.username, status = %resp.status(), "failed login attempt");
+                    return None.or_forbidden("invalid credentials");
+                }
+                s if s.is_server_error() => {
+                    tracing::error!(username = %request.username, status = %s, "auth server error");
+                    return None.or_internal_err("auth server error");
+                }
+                s => {
+                    tracing::warn!(username = %request.username, status = %s, "unexpected response from auth server");
+                    return None.or_internal_err("unexpected response from auth server");
+                }
+            }
         }
 
         let token_resp: TokenResponse = resp
@@ -207,11 +229,16 @@ impl SimpleServer {
         api_url: String,
         api_secret: String,
     ) -> error::Result<Self, Whatever> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .whatever_context("building HTTP client")?;
         Ok(SimpleServer {
             state: Mutex::new(SimpleServerInner {
                 hkey_map: HashMap::new(),
                 users: HashMap::new(),
             }),
+            http_client,
             api_url,
             api_secret,
             base_folder: base_folder.to_path_buf(),
