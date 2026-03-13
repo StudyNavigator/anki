@@ -45,8 +45,8 @@ use crate::sync::response::SyncResponse;
 pub struct SimpleServer {
     state: Mutex<SimpleServerInner>,
     http_client: reqwest::Client,
-    api_url: String,
-    api_secret: String,
+    auth_base_url: String,
+    auth_secret: String,
     base_folder: PathBuf,
 }
 
@@ -67,8 +67,8 @@ pub struct SyncServerConfig {
     pub base_folder: PathBuf,
     #[serde(default = "default_ip_header")]
     pub ip_header: ClientIpSource,
-    pub api_url: String,
-    pub api_secret: String,
+    pub auth_base_url: String,
+    pub auth_secret: String,
 }
 
 fn default_host() -> IpAddr {
@@ -143,9 +143,9 @@ impl SimpleServer {
 
         let resp = self
             .http_client
-            .get(format!("{}/internal/sync/verify", self.api_url))
+            .get(format!("{}/internal/sync/verify", self.auth_base_url))
             .header("Authorization", format!("Bearer {hkey}"))
-            .header("X-Internal-Secret", &self.api_secret)
+            .header("X-Internal-Secret", &self.auth_secret)
             .send()
             .await
             .ok()?;
@@ -174,8 +174,8 @@ impl SimpleServer {
 
         let resp = self
             .http_client
-            .post(format!("{}/internal/sync/token", self.api_url))
-            .header("X-Internal-Secret", &self.api_secret)
+            .post(format!("{}/internal/sync/token", self.auth_base_url))
+            .header("X-Internal-Secret", &self.auth_secret)
             .json(&TokenRequest {
                 username: &request.username,
                 password: &request.password,
@@ -226,8 +226,8 @@ impl SimpleServer {
 
     pub fn new(
         base_folder: &Path,
-        api_url: String,
-        api_secret: String,
+        auth_base_url: String,
+        auth_secret: String,
     ) -> error::Result<Self, Whatever> {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -239,8 +239,8 @@ impl SimpleServer {
                 users: HashMap::new(),
             }),
             http_client,
-            api_url,
-            api_secret,
+            auth_base_url,
+            auth_secret,
             base_folder: base_folder.to_path_buf(),
         })
     }
@@ -249,8 +249,12 @@ impl SimpleServer {
         config: SyncServerConfig,
     ) -> error::Result<(SocketAddr, ServerFuture), Whatever> {
         let server = Arc::new(
-            SimpleServer::new(&config.base_folder, config.api_url, config.api_secret)
-                .whatever_context("unable to create server")?,
+            SimpleServer::new(
+                &config.base_folder,
+                config.auth_base_url,
+                config.auth_secrett,
+            )
+            .whatever_context("unable to create server")?,
         );
         let address = &format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind(address)

@@ -8,8 +8,8 @@ export PROTOC="$(which protoc)"
 export SYNC_PORT="9090"
 export SYNC_HOST="0.0.0.0"
 export SYNC_BASE="./scratchpad/anki_data"
-export SYNC_API_URL="https://sn.atomicjolt.xyz"
-export SYNC_API_SECRET="c94325ec2f397c37a54757d1a4be2bbfa3fce7c5821e59543cbeabe053915ea3"
+export SYNC_AUTH_BASE_URL="https://sn.atomicjolt.xyz"
+export SYNC_AUTH_SECRET="c94325ec2f397c37a54757d1a4be2bbfa3fce7c5821e59543cbeabe053915ea3"
 
 
 cargo run -p anki-sync-server
