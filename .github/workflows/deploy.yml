@@ -3,7 +3,7 @@ name: Build and Deploy Sync Server
 on:
   push:
     tags:
-      - "v*"
+      - "sn-sync-v*"
   workflow_dispatch:
 
 env:
