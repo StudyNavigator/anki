@@ -252,7 +252,7 @@ impl SimpleServer {
             SimpleServer::new(
                 &config.base_folder,
                 config.auth_base_url,
-                config.auth_secrett,
+                config.auth_secret,
             )
             .whatever_context("unable to create server")?,
         );
