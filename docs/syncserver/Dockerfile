@@ -8,7 +8,7 @@ RUN apk update && apk add --no-cache build-base protobuf && rm -rf /var/cache/ap
 
 ENV PROTOC=/usr/bin/protoc
 
-RUN cargo build --release --package anki-sync-server
+RUN cargo build --release --locked --package anki-sync-server
 
 FROM alpine:3.21.0
 

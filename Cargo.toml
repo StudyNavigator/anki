@@ -142,6 +142,7 @@ unicode-normalization = "0.1.24"
 walkdir = "2.5.0"
 which = "8.0.0"
 widestring = "1.1.0"
+winapi = { version = "0.3", features = ["wincon", "winreg"] }
 windows = { version = "0.61.3", features = ["Media_SpeechSynthesis", "Media_Core", "Foundation_Collections", "Storage_Streams", "Win32_System_Console", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_Foundation", "Win32_UI_Shell", "Wdk_System_SystemServices"] }
 wiremock = "0.6.3"
 xz2 = "0.1.7"
@@ -167,6 +168,8 @@ debug = 0
 # Debug info off by default, which speeds up incremental builds and produces a considerably
 # smaller library.
 [profile.dev.package.anki]
+debug = 0
+[profile.dev.package.rsbridge]
 debug = 0
 
 [profile.release-lto]

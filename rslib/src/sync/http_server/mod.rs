@@ -116,7 +116,7 @@ impl SimpleServer {
             // Create the User entry if this is a first-ever login for this user_id.
             if !state.users.contains_key(&id) {
                 let user = User::new(&id, &self.base_folder)
-                    .ok()
+                    .map_err(|e| e.to_string())
                     .or_internal_err("creating user")?;
                 state.users.insert(id.clone(), user);
             }
