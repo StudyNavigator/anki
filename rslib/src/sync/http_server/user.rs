@@ -15,7 +15,6 @@ use crate::sync::http_server::media_manager::ServerMediaManager;
 
 pub(in crate::sync) struct User {
     pub name: String,
-    pub password_hash: String,
     pub col: Option<Collection>,
     pub sync_state: Option<ServerSyncState>,
     pub media: ServerMediaManager,
@@ -23,6 +22,24 @@ pub(in crate::sync) struct User {
 }
 
 impl User {
+    pub(in crate::sync) fn new(
+        user_id: &str,
+        base_folder: &std::path::Path,
+    ) -> crate::error::Result<Self, snafu::Whatever> {
+        use anki_io::create_dir_all;
+        use snafu::ResultExt;
+        let folder = base_folder.join(user_id);
+        create_dir_all(&folder).whatever_context("creating user folder")?;
+        let media = ServerMediaManager::new(&folder).whatever_context("opening media")?;
+        Ok(User {
+            name: user_id.into(),
+            col: None,
+            sync_state: None,
+            media,
+            folder,
+        })
+    }
+
     /// Run op with access to the collection. If a sync is active, it's aborted.
     pub(crate) fn with_col<F, T>(&mut self, op: F) -> HttpResult<T>
     where

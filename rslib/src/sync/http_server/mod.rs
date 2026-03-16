@@ -18,29 +18,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use anki_io::create_dir_all;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use axum::Router;
 use axum_client_ip::ClientIpSource;
-use pbkdf2::password_hash::PasswordHash;
-use pbkdf2::password_hash::PasswordHasher;
-use pbkdf2::password_hash::PasswordVerifier;
-use pbkdf2::password_hash::SaltString;
-use pbkdf2::Pbkdf2;
-use snafu::whatever;
-use snafu::OptionExt;
+use hyper::StatusCode;
 use snafu::ResultExt;
 use snafu::Whatever;
 use tokio::net::TcpListener;
 use tracing::Span;
 
 use crate::error;
-use crate::media::files::sha1_of_data;
 use crate::sync::error::HttpResult;
 use crate::sync::error::OrHttpErr;
 use crate::sync::http_server::logging::with_logging_layer;
-use crate::sync::http_server::media_manager::ServerMediaManager;
 use crate::sync::http_server::routes::collection_sync_router;
 use crate::sync::http_server::routes::health_check_handler;
 use crate::sync::http_server::routes::media_sync_router;
@@ -53,10 +44,16 @@ use crate::sync::response::SyncResponse;
 
 pub struct SimpleServer {
     state: Mutex<SimpleServerInner>,
+    http_client: reqwest::Client,
+    auth_base_url: String,
+    auth_secret: String,
+    base_folder: PathBuf,
 }
 
 pub struct SimpleServerInner {
-    /// hkey->user
+    /// hkey -> user_id
+    hkey_map: HashMap<String, String>,
+    /// user_id -> User
     users: HashMap<String, User>,
 }
 
@@ -70,6 +67,8 @@ pub struct SyncServerConfig {
     pub base_folder: PathBuf,
     #[serde(default = "default_ip_header")]
     pub ip_header: ClientIpSource,
+    pub auth_base_url: String,
+    pub auth_secret: String,
 }
 
 fn default_host() -> IpAddr {
@@ -90,67 +89,6 @@ pub fn default_ip_header() -> ClientIpSource {
     ClientIpSource::ConnectInfo
 }
 
-impl SimpleServerInner {
-    fn new_from_env(base_folder: &Path) -> error::Result<Self, Whatever> {
-        let mut idx = 1;
-        let mut users: HashMap<String, User> = Default::default();
-        loop {
-            let envvar = format!("SYNC_USER{idx}");
-            match std::env::var(&envvar) {
-                Ok(val) => {
-                    let hkey = derive_hkey(&val);
-                    let (name, pwhash) = {
-                        let (name, password) = val.split_once(':').with_whatever_context(|| {
-                            format!("{envvar} should be in 'username:password' format.")
-                        })?;
-                        if std::env::var("PASSWORDS_HASHED").is_ok() {
-                            (name, password.to_string())
-                        } else {
-                            (
-                                name,
-                                // Plain text passwords provided; hash them with a fixed salt.
-                                Pbkdf2
-                                    .hash_password(
-                                        password.as_bytes(),
-                                        &SaltString::from_b64("tonuvYGpksNFQBlEmm3lxg").unwrap(),
-                                    )
-                                    .expect("couldn't hash password")
-                                    .to_string(),
-                            )
-                        }
-                    };
-                    let folder = base_folder.join(name);
-                    create_dir_all(&folder).whatever_context("creating SYNC_BASE")?;
-                    let media =
-                        ServerMediaManager::new(&folder).whatever_context("opening media")?;
-                    users.insert(
-                        hkey,
-                        User {
-                            name: name.into(),
-                            password_hash: pwhash,
-                            col: None,
-                            sync_state: None,
-                            media,
-                            folder,
-                        },
-                    );
-                    idx += 1;
-                }
-                Err(_) => break,
-            }
-        }
-        if users.is_empty() {
-            whatever!("No users defined; SYNC_USER1 env var should be set.");
-        }
-        Ok(Self { users })
-    }
-}
-
-// This is not what AnkiWeb does, but should suffice for this use case.
-fn derive_hkey(user_and_pass: &str) -> String {
-    hex::encode(sha1_of_data(user_and_pass.as_bytes()))
-}
-
 impl SimpleServer {
     pub(in crate::sync) async fn with_authenticated_user<F, I, O>(
         &self,
@@ -160,75 +98,150 @@ impl SimpleServer {
     where
         F: FnOnce(&mut User, SyncRequest<I>) -> HttpResult<O>,
     {
+        let hkey = req.sync_key.clone();
+
+        // Check cache without holding the lock across an await point.
+        let cached_user_id = self.state.lock().unwrap().hkey_map.get(&hkey).cloned();
+
+        let user_id = if let Some(id) = cached_user_id {
+            id
+        } else {
+            let id = self
+                .verify_hkey(&hkey)
+                .await
+                .or_forbidden("invalid or expired token")?;
+            let mut state = self.state.lock().unwrap();
+            // Remove any stale hkeys that pointed to the same user.
+            state.hkey_map.retain(|_, v| v != &id);
+            // Create the User entry if this is a first-ever login for this user_id.
+            if !state.users.contains_key(&id) {
+                let user = User::new(&id, &self.base_folder)
+                    .map_err(|e| e.to_string())
+                    .or_internal_err("creating user")?;
+                state.users.insert(id.clone(), user);
+            }
+            state.hkey_map.insert(hkey.clone(), id.clone());
+            id
+        };
+
         let mut state = self.state.lock().unwrap();
         let user = state
             .users
-            .get_mut(&req.sync_key)
-            .or_forbidden("invalid hkey")?;
+            .get_mut(&user_id)
+            .or_internal_err("fetching user")?;
         Span::current().record("uid", &user.name);
         Span::current().record("client", &req.client_version);
         Span::current().record("session", &req.session_key);
         op(user, req)
     }
 
-    pub(in crate::sync) fn get_host_key(
+    async fn verify_hkey(&self, hkey: &str) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct VerifyResponse {
+            user_id: String,
+        }
+
+        let resp = self
+            .http_client
+            .get(format!("{}/internal/sync/verify", self.auth_base_url))
+            .header("Authorization", format!("Bearer {hkey}"))
+            .header("X-Internal-Secret", &self.auth_secret)
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        resp.json::<VerifyResponse>().await.ok().map(|r| r.user_id)
+    }
+
+    pub(in crate::sync) async fn get_host_key(
         &self,
         request: HostKeyRequest,
     ) -> HttpResult<SyncResponse<HostKeyResponse>> {
-        let state = self.state.lock().unwrap();
+        #[derive(serde::Serialize)]
+        struct TokenRequest<'a> {
+            username: &'a str,
+            password: &'a str,
+        }
 
-        // This control structure might seem a bit crude,
-        // its goal is to prevent a timing attack from gaining
-        // information about whether a specific user exists.
-        let user = {
-            // This inner block returns Ok(hkey,user) if a user with corresponding
-            // name is found and Err(user) with a random user if it isn't found.
-            // The user is needed to verify against a random hash,
-            // before returning an Error.
-            let mut result: Result<(String, &User), &User> =
-                Err(state.users.iter().next().unwrap().1);
-            for (hkey, user) in state.users.iter() {
-                if user.name == request.username {
-                    result = Ok((hkey.to_string(), user));
-                }
-            }
-            result
-        };
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            hkey: String,
+        }
 
-        match user {
-            Ok((key, user)) => {
-                // Verify password
-                let pwhash =
-                    &PasswordHash::new(&user.password_hash).expect("couldn't parse password hash");
-                if Pbkdf2
-                    .verify_password(request.password.as_bytes(), pwhash)
-                    .is_ok()
-                {
-                    SyncResponse::try_from_obj(HostKeyResponse { key })
-                } else {
-                    None.or_forbidden("invalid user/pass in get_host_key")
+        let resp = self
+            .http_client
+            .post(format!("{}/internal/sync/token", self.auth_base_url))
+            .header("X-Internal-Secret", &self.auth_secret)
+            .json(&TokenRequest {
+                username: &request.username,
+                password: &request.password,
+            })
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "failed to contact auth server");
+                e
+            })
+            .or_internal_err("failed to contact auth server")?;
+
+        if !resp.status().is_success() {
+            match resp.status() {
+                StatusCode::UNAUTHORIZED => {
+                    tracing::warn!(username = %request.username, status = %resp.status(), "failed login attempt");
+                    return None.or_forbidden("invalid credentials");
                 }
-            }
-            Err(user) => {
-                // Verify random password, in order to ensure constant-timedness,
-                // then return an error
-                let pwhash =
-                    &PasswordHash::new(&user.password_hash).expect("couldn't parse password hash");
-                let _ = Pbkdf2.verify_password(request.password.as_bytes(), pwhash);
-                None.or_forbidden("invalid user/pass in get_host_key")
+                s if s.is_server_error() => {
+                    tracing::error!(username = %request.username, status = %s, "auth server error");
+                    return None.or_internal_err("auth server error");
+                }
+                s => {
+                    tracing::warn!(username = %request.username, status = %s, "unexpected response from auth server");
+                    return None.or_internal_err("unexpected response from auth server");
+                }
             }
         }
+
+        let token_resp: TokenResponse = resp
+            .json()
+            .await
+            .ok()
+            .or_internal_err("invalid response from auth server")?;
+
+        SyncResponse::try_from_obj(HostKeyResponse {
+            key: token_resp.hkey,
+        })
+        .or_internal_err("encoding response")
     }
+
     pub fn is_running() -> bool {
         let config = envy::prefixed("SYNC_")
             .from_env::<SyncServerConfig>()
             .unwrap();
         std::net::TcpStream::connect(format!("{}:{}", config.host, config.port)).is_ok()
     }
-    pub fn new(base_folder: &Path) -> error::Result<Self, Whatever> {
-        let inner = SimpleServerInner::new_from_env(base_folder)?;
+
+    pub fn new(
+        base_folder: &Path,
+        auth_base_url: String,
+        auth_secret: String,
+    ) -> error::Result<Self, Whatever> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .whatever_context("building HTTP client")?;
         Ok(SimpleServer {
-            state: Mutex::new(inner),
+            state: Mutex::new(SimpleServerInner {
+                hkey_map: HashMap::new(),
+                users: HashMap::new(),
+            }),
+            http_client,
+            auth_base_url,
+            auth_secret,
+            base_folder: base_folder.to_path_buf(),
         })
     }
 
@@ -236,7 +249,12 @@ impl SimpleServer {
         config: SyncServerConfig,
     ) -> error::Result<(SocketAddr, ServerFuture), Whatever> {
         let server = Arc::new(
-            SimpleServer::new(&config.base_folder).whatever_context("unable to create server")?,
+            SimpleServer::new(
+                &config.base_folder,
+                config.auth_base_url,
+                config.auth_secret,
+            )
+            .whatever_context("unable to create server")?,
         );
         let address = &format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind(address)

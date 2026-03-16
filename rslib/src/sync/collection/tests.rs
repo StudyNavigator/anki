@@ -88,6 +88,8 @@ where
         port: 0,
         base_folder: base_folder.path().into(),
         ip_header: default_ip_header(),
+        auth_base_url: String::from("http://localhost:8080"),
+        auth_secret: String::from("test-internal-secret"),
     })
     .await
     .unwrap();

@@ -7,10 +7,8 @@ set -o pipefail
 export PUID=${PUID:-1000}
 export PGID=${PGID:-1000}
 
-# These values are fixed and cannot be overwritten from the outside for
-# convenience and safety reasons
-export SYNC_PORT=8080
-export SYNC_BASE=/anki_data
+export SYNC_PORT=${SYNC_PORT:-8080}
+export SYNC_BASE=${SYNC_BASE:-/anki_data}
 
 # Check if group exists, create if not
 if ! getent group anki-group > /dev/null 2>&1; then
@@ -23,8 +21,8 @@ if ! id -u anki > /dev/null 2>&1; then
 fi
 
 # Fix ownership of mounted volumes
-mkdir -p /anki_data
-chown anki:anki-group /anki_data
+mkdir -p "$SYNC_BASE"
+chown anki:anki-group "$SYNC_BASE"
 
 # Run the provided command as the `anki` user
 exec su-exec anki "$@"

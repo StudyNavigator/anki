@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -e
+set -o pipefail
+
+export PROTOC="$(which protoc)"
+
+export SYNC_PORT="9090"
+export SYNC_HOST="0.0.0.0"
+export SYNC_BASE="./scratchpad/anki_data"
+export SYNC_AUTH_BASE_URL="https://sn.atomicjolt.xyz"
+export SYNC_AUTH_SECRET="9e5c25de7061253ec8725528d07529f56d582a87997d7b413ce7c594348fb0d1"
+
+
+cargo run -p anki-sync-server
